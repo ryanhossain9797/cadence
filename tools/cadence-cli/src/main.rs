@@ -29,15 +29,23 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Commands::Play { path } => {
-            let info = player.load_and_play(&path)?;
-            println!("Playing: {}", info.path);
-            if let Some(d) = info.duration_ms {
-                println!("Duration ~ {} ms", d);
+            match player.load_and_play(&path) {
+                Ok(info) => {
+                    println!("Playing: {}", info.path);
+                    if let Some(d) = info.duration_ms {
+                        println!("Duration ~ {} ms", d);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Rodio failed ({e}). Trying Symphonia...");
+                    let info = player.load_and_play_symphonia(&path)?;
+                    println!("Playing (symphonia): {}", info.path);
+                    if let Some(d) = info.duration_ms {
+                        println!("Duration ~ {} ms", d);
+                    }
+                }
             }
-            // Keep process alive while playing; crude loop for MVP.
-            while !player.empty() && !player.is_paused() {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
+            player.sleep_until_end();
         }
         Commands::Pause => player.pause(),
         Commands::Resume => player.resume(),
