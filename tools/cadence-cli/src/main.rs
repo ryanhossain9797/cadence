@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     let mut player = Player::new()?;
 
     // Play the file
-    let info = player.load_and_play(&cli.path)?;
+    let info = player.load_and_play(cli.path.clone())?;
     println!(
         "Playing: {} ({} ms)",
         info.path,
