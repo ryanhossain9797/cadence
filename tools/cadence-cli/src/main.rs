@@ -2,6 +2,7 @@ use anyhow::Result;
 use cadence_core::Player;
 use clap::Parser;
 use std::io::{self, BufRead, Write};
+use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(name = "cadence", version, about = "Cadence CLI (MVP)")]
@@ -10,9 +11,55 @@ struct Cli {
     path: String,
 }
 
+/// Commands available in the REPL
+#[derive(Debug, PartialEq)]
+enum Command {
+    Pause,
+    Resume,
+    Stop,
+    Advance { seconds: i64 },
+    Quit,
+    Help,
+}
+
+impl FromStr for Command {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+
+        if parts.is_empty() {
+            return Err("Empty command".to_string());
+        }
+
+        match parts[0] {
+            "pause" => Ok(Command::Pause),
+            "resume" => Ok(Command::Resume),
+            "stop" => Ok(Command::Stop),
+            "+" | "-" => {
+                if parts.len() < 2 {
+                    Err("Usage: +/- <seconds>. Enter a number after +/-".to_string())
+                } else {
+                    let signed = format!("{}{}", parts[0], parts[1]);
+                    match signed.parse::<i64>() {
+                        Ok(seconds) => Ok(Command::Advance { seconds }),
+                        Err(_) => Err(format!("Invalid number: {}", parts[1])),
+                    }
+                }
+            }
+            "quit" | "q" | "exit" => Ok(Command::Quit),
+            "help" | "h" => Ok(Command::Help),
+            cmd => Err(format!(
+                "Unknown command: {}. Type 'help' for commands.",
+                cmd
+            )),
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let player = Player::new()?;
+    let mut player = Player::new()?;
 
     // Play the file
     let info = player.load_and_play(&cli.path)?;
@@ -21,9 +68,10 @@ fn main() -> Result<()> {
         info.path,
         info.duration_ms.unwrap_or(0)
     );
-    
-    let commands_description = "Commands: pause, resume, stop, +/- <seconds> (advance or rewind by <seconds>), quit";
-    
+
+    let commands_description =
+        "Commands: pause, resume, stop, +/- <seconds> (advance or rewind by <seconds>), quit";
+
     println!("{}", commands_description);
 
     // REPL loop for commands
@@ -34,51 +82,40 @@ fn main() -> Result<()> {
     for line in stdin.lock().lines() {
         let line = line?;
         let input = line.trim();
-        let parts: Vec<&str> = input.split_whitespace().collect();
 
-        if parts.is_empty() {
+        if input.is_empty() {
             print!("> ");
             io::stdout().flush()?;
             continue;
         }
 
-        match parts[0] {
-            "pause" => {
+        match input.parse::<Command>() {
+            Ok(Command::Pause) => {
                 player.pause();
                 println!("Paused");
             }
-            "resume" => {
+            Ok(Command::Resume) => {
                 player.resume();
                 println!("Resumed");
             }
-            "stop" => {
+            Ok(Command::Stop) => {
                 player.stop();
                 println!("Stopped");
             }
-            "+" | "-" => {
-                if parts.len() < 2 {
-                    println!("Usage: +/- <seconds>. enter a number after +/- !!>");
-                } else {
-                    match parts[1].parse::<u64>() {
-                        Ok(secs) => {
-                            let delta = if parts[0] == "+" { secs as i64 } else { -(secs as i64) };
-                            if let Err(e) = player.advance_or_rewind(&cli.path, delta * 1000) {
-                                println!("Error: {}", e);
-                            }
-                        }
-                        Err(_) => println!("Invalid number: {}", parts[1]),
-                    }
+            Ok(Command::Advance { seconds }) => {
+                if let Err(e) = player.advance_or_rewind(&cli.path, seconds * 1000) {
+                    println!("Error: {}", e);
                 }
             }
-            "quit" | "q" | "exit" => {
+            Ok(Command::Quit) => {
                 player.stop();
                 break;
             }
-            "help" | "h" => {
+            Ok(Command::Help) => {
                 println!("{}", commands_description);
             }
-            _ => {
-                println!("Unknown command: {}. Type 'help' for commands.", parts[0]);
+            Err(e) => {
+                println!("{}", e);
             }
         }
 
