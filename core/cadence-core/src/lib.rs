@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::Serialize;
+use parking_lot::Mutex;
+use std::time::Instant;
 use std::{fs::File, io::BufReader, path::Path};
 
 #[derive(Debug, Clone, Serialize)]
@@ -13,6 +15,8 @@ pub struct Player {
     _stream: OutputStream,
     _handle: OutputStreamHandle,
     sink: Sink,
+    last_playback_time: Mutex<Option<Instant>>,
+    last_playback_position: Mutex<u64>
 }
 
 impl Player {
@@ -24,10 +28,22 @@ impl Player {
             _stream: stream,
             _handle: handle,
             sink,
+            last_playback_time: Mutex::new(None),
+            last_playback_position: Mutex::new(0)
         })
     }
 
+    pub fn current_position_ms(&self) -> u64 {
+        let last_playback_position = *self.last_playback_position.lock();
+        match *self.last_playback_time.lock() {
+            Some(instant) => last_playback_position + instant.elapsed().as_millis() as u64,
+            None => last_playback_position, // paused
+        }
+    }
+
     pub fn load_and_play<P: AsRef<Path>>(&self, path: P) -> Result<TrackInfo> {
+        *self.last_playback_position.lock() = 0;
+        *self.last_playback_time.lock() = Some(Instant::now());
         let p = path.as_ref();
 
         // Open once for duration using the same decoder we’ll use for playback.
@@ -47,11 +63,15 @@ impl Player {
     }
 
     pub fn pause(&self) {
+        *self.last_playback_position.lock() = self.current_position_ms();
+        *self.last_playback_time.lock() = None;
         self.sink.pause();
     }
     pub fn resume(&self) {
+        *self.last_playback_time.lock() = Some(Instant::now());
         self.sink.play();
     }
+
     pub fn stop(&self) {
         self.sink.stop();
     }
@@ -81,8 +101,16 @@ impl Player {
         self.sink.stop();
         self.sink.append(skipped);
         self.sink.play();
+        *self.last_playback_position.lock() = to_ms;
+        *self.last_playback_time.lock() = Some(Instant::now());
 
         Ok(())
+    }
+
+    pub fn advance_or_rewind<P: AsRef<Path>>(&self, path: P, delta_ms: i64) -> Result<()> {
+        let current = self.current_position_ms() as i64;
+        let target = (current + delta_ms).max(0) as u64;
+        self.seek_approx(path, target)
     }
 
     pub fn sleep_until_end(&self) {
