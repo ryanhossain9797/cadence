@@ -1,22 +1,69 @@
 use anyhow::{Context, Result};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use serde::Serialize;
-use parking_lot::Mutex;
+use std::path::PathBuf;
 use std::time::Instant;
-use std::{fs::File, io::BufReader, path::Path};
+use std::{fs::File, io::BufReader};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrackInfo {
-    pub path: String,
+    pub path: PathBuf,
     pub duration_ms: Option<u64>,
+}
+
+/// Represents the current state of a playing track
+#[derive(Debug)]
+pub struct CurrentTrack {
+    /// Information about the track (path, duration)
+    pub info: TrackInfo,
+    /// When playback last started/resumed; None when paused
+    pub last_playback_time: Option<Instant>,
+    /// Position in ms at the time of last playback start/pause
+    pub last_playback_position: u64,
+}
+
+impl CurrentTrack {
+    /// Create a new CurrentTrack starting from position 0
+    fn new(info: TrackInfo) -> Self {
+        Self {
+            info,
+            last_playback_time: Some(Instant::now()),
+            last_playback_position: 0,
+        }
+    }
+
+    /// Get the current playback position in milliseconds
+    pub fn current_position_ms(&self) -> u64 {
+        match self.last_playback_time {
+            Some(instant) => self.last_playback_position + instant.elapsed().as_millis() as u64,
+            None => self.last_playback_position,
+        }
+    }
+
+    /// Mark as paused, capturing current position
+    fn pause(&mut self) {
+        self.last_playback_position = self.current_position_ms();
+        self.last_playback_time = None;
+    }
+
+    /// Mark as resumed, starting time tracking from now
+    fn resume(&mut self) {
+        self.last_playback_time = Some(Instant::now());
+    }
+
+    /// Update position and reset time tracking (used after seek)
+    fn set_position(&mut self, position_ms: u64) {
+        self.last_playback_position = position_ms;
+        self.last_playback_time = Some(Instant::now());
+    }
 }
 
 pub struct Player {
     _stream: OutputStream,
     _handle: OutputStreamHandle,
     sink: Sink,
-    last_playback_time: Mutex<Option<Instant>>,
-    last_playback_position: Mutex<u64>
+    /// Current track state, if any
+    current_track: Option<CurrentTrack>,
 }
 
 impl Player {
@@ -28,60 +75,70 @@ impl Player {
             _stream: stream,
             _handle: handle,
             sink,
-            last_playback_time: Mutex::new(None),
-            last_playback_position: Mutex::new(0)
+            current_track: None,
         })
     }
 
-    pub fn current_position_ms(&self) -> u64 {
-        let last_playback_position = *self.last_playback_position.lock();
-        match *self.last_playback_time.lock() {
-            Some(instant) => last_playback_position + instant.elapsed().as_millis() as u64,
-            None => last_playback_position, // paused
-        }
+    /// Get the current track, if any
+    pub fn current_track(&self) -> Option<&CurrentTrack> {
+        self.current_track.as_ref()
     }
 
-    pub fn load_and_play<P: AsRef<Path>>(&self, path: P) -> Result<TrackInfo> {
-        *self.last_playback_position.lock() = 0;
-        *self.last_playback_time.lock() = Some(Instant::now());
-        let p = path.as_ref();
+    /// Get the current playback position in milliseconds, or 0 if no track
+    pub fn current_position_ms(&self) -> u64 {
+        self.current_track
+            .as_ref()
+            .map(|t| t.current_position_ms())
+            .unwrap_or(0)
+    }
 
-        // Open once for duration using the same decoder we’ll use for playback.
-        let f1 = File::open(p).with_context(|| format!("Failed to open {:?}", p))?;
-        let src = Decoder::new(BufReader::new(f1))
-            .with_context(|| format!("Unsupported/invalid audio: {:?}", p))?;
+    pub fn load_and_play(&mut self, path: PathBuf) -> Result<TrackInfo> {
+        // Open once for duration using the same decoder we'll use for playback.
+        let file = File::open(&path).with_context(|| format!("Failed to open {:?}", path))?;
+        let src = Decoder::new(BufReader::new(file))
+            .with_context(|| format!("Unsupported/invalid audio: {:?}", path))?;
         let dur = src.total_duration().map(|d| d.as_millis() as u64);
 
-        self.sink.stop();
+        let info = TrackInfo {
+            path,
+            duration_ms: dur,
+        };
+
+        self.sink.clear();
         self.sink.append(src);
         self.sink.play();
 
-        Ok(TrackInfo {
-            path: p.to_string_lossy().into_owned(),
-            duration_ms: dur,
-        })
+        self.current_track = Some(CurrentTrack::new(info.clone()));
+
+        Ok(info)
     }
 
-    pub fn pause(&self) {
-        *self.last_playback_position.lock() = self.current_position_ms();
-        *self.last_playback_time.lock() = None;
+    pub fn pause(&mut self) {
+        if let Some(track) = &mut self.current_track {
+            track.pause();
+        }
         self.sink.pause();
     }
-    pub fn resume(&self) {
-        *self.last_playback_time.lock() = Some(Instant::now());
+
+    pub fn resume(&mut self) {
+        if let Some(track) = &mut self.current_track {
+            track.resume();
+        }
         self.sink.play();
     }
 
-    pub fn stop(&self) {
+    pub fn stop(&mut self) {
         self.sink.stop();
+        self.current_track = None;
     }
 
-    /// Naive “seek”: stops + re-queues from an offset by skipping samples (approx).
-    /// This is placeholder until we switch to a decoder with random access control.
-    pub fn seek_approx<P: AsRef<Path>>(&self, path: P, to_ms: u64) -> Result<()> {
+    pub fn seek_approx(&mut self, to_ms: u64) -> Result<()> {
         use std::time::Duration;
 
-        let path = path.as_ref();
+        let path = match &self.current_track {
+            Some(track) => &track.info.path,
+            None => return Ok(()), // No track to seek
+        };
 
         // Open once to query total duration
         let file = File::open(path)?;
@@ -98,22 +155,20 @@ impl Player {
 
         let skipped = src.skip_duration(to); // returns a Source wrapper, not a Duration
 
-        self.sink.stop();
+        self.sink.clear();
         self.sink.append(skipped);
         self.sink.play();
-        *self.last_playback_position.lock() = to_ms;
-        *self.last_playback_time.lock() = Some(Instant::now());
+
+        if let Some(track) = &mut self.current_track {
+            track.set_position(to_ms);
+        }
 
         Ok(())
     }
 
-    pub fn advance_or_rewind<P: AsRef<Path>>(&self, path: P, delta_ms: i64) -> Result<()> {
+    pub fn advance_or_rewind(&mut self, delta_ms: i64) -> Result<()> {
         let current = self.current_position_ms() as i64;
         let target = (current + delta_ms).max(0) as u64;
-        self.seek_approx(path, target)
-    }
-
-    pub fn sleep_until_end(&self) {
-        self.sink.sleep_until_end();
+        self.seek_approx(target)
     }
 }
